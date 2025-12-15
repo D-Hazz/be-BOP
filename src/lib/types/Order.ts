@@ -1,3 +1,4 @@
+// src/lib/types/Order.ts
 import type { Product } from './Product';
 import type { Currency } from './Currency';
 import type { CountryAlpha2 } from './Country';

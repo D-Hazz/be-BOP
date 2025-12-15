@@ -1,3 +1,5 @@
+// src/routes/%28app%29/checkout/%2Bpage.server.ts
+import { createLightningInvoice } from '$lib/server/breez';
 import { collections, withTransaction } from '$lib/server/database';
 import { paymentMethods } from '$lib/server/payment-methods';
 import { COUNTRY_ALPHA2S, type CountryAlpha2 } from '$lib/types/Country';
@@ -76,6 +78,26 @@ export async function load({ parent, locals }) {
 			}
 		)
 	]);
+
+	let breezInvoiceData: any = null;
+	if (paymentMethod === 'Breez SDK') {
+		if (priceInfo.totalPriceWithVat === 0) {
+			throw error(400, 'Montant nul non supporté par Breez');
+		}
+		const totalSatoshis = Math.round(
+			toSatoshis(priceInfo.totalPriceWithVat, priceInfo.currency)
+		);
+		
+		breezInvoiceData = await createLightningInvoice(
+			totalSatoshis,
+			`Commande ${orderId} - ${cart.items.map(i => i.quantity + 'x ' + byId[i.productId].name).join(', ')}`
+		);
+		
+		// Vérifiez le minimum Breez si nécessaire
+		if (totalSatoshis < 1000) { // Exemple: 1000 sats minimum
+			throw error(400, 'Montant trop faible pour Breez (minimum 1000 sats)');
+		}
+	}
 
 	let methods = paymentMethods({ hasPosOptions: locals.user?.hasPosOptions });
 

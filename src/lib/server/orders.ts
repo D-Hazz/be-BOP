@@ -84,6 +84,11 @@ import { isSwissBitcoinPayConfigured, sbpCreateCheckout } from './swiss-bitcoin-
 import type { PaidSubscription } from '$lib/types/PaidSubscription';
 import { btcpayCreateLnInvoice, isBtcpayServerConfigured } from './btcpay-server';
 
+// Ajoutez ces imports avec les existants :
+import { isBreezConfigured, createLightningInvoice } from './breez';
+import { differenceInSeconds } from 'date-fns';
+
+
 export async function conflictingTapToPayOrder(orderId: string): Promise<string | null> {
 	const other = await collections.orders.findOne({
 		_id: { $ne: orderId },
@@ -1669,22 +1674,23 @@ async function generatePaymentInfo(params: {
 
 			throw new Error('No bitcoin payment processors available.');
 		}
+
 		case 'lightning': {
 			const label = (() => {
 				switch (runtimeConfig.lightningQrCodeDescription) {
-					case 'brand':
-						return runtimeConfig.brandName;
-					case 'orderUrl':
-						return `${ORIGIN}/order/${params.orderId}`;
-					case 'brandAndOrderNumber':
-						return `${runtimeConfig.brandName} - Order #${params.orderNumber.toLocaleString('en')}`;
-					default:
-						return '';
+				case 'brand': return runtimeConfig.brandName;
+				case 'orderUrl': return `${ORIGIN}/order/${params.orderId}`;
+				case 'brandAndOrderNumber':
+					return `${runtimeConfig.brandName} - Order ${params.orderNumber.toLocaleString('en')}`;
+				default: return runtimeConfig.brandName;
 				}
 			})();
+
 			const satoshis = toSatoshis(params.toPay.amount, params.toPay.currency);
+
 			const preference = runtimeConfig.paymentProcessorPreferences?.lightning;
 			const hardcodedPriority: PaymentProcessor[] = [
+				'Breez SDK',
 				'swiss-bitcoin-pay',
 				'btcpay-server',
 				'phoenixd',
@@ -1692,93 +1698,230 @@ async function generatePaymentInfo(params: {
 			];
 
 			const availability: Partial<Record<PaymentProcessor, boolean>> = {
+				'Breez SDK': isBreezConfigured(),
 				'swiss-bitcoin-pay': isSwissBitcoinPayConfigured(),
 				'btcpay-server': isBtcpayServerConfigured(),
-				phoenixd: isPhoenixdConfigured(),
-				lnd: isLndConfigured()
+				'phoenixd': isPhoenixdConfigured(),
+				'lnd': isLndConfigured()
 			};
 
-			const generators: Partial<
-				Record<
-					PaymentProcessor,
-					() => Promise<{
-						address?: string;
-						wallet?: string;
-						label?: string;
-						invoiceId?: string;
-						checkoutId?: string;
-						meta?: unknown;
-						processor?: PaymentProcessor;
-					}>
-				>
-			> = {
-				'swiss-bitcoin-pay': async () => {
-					const invoice = await swissBitcoinPayCreateInvoice({
-						label,
-						orderId: `${params.orderNumber}`,
-						expiresAt: params.expiresAt,
-						toPay: {
-							amount: satoshis,
-							currency: 'SAT'
-						}
-					});
+			const orderedProcessors = preference
+				? preference.filter((p): p is PaymentProcessor => availability[p])
+				: hardcodedPriority.filter((p) => availability[p]);
+
+			const generators: Partial<Record<
+				PaymentProcessor,
+				() => Promise<{
+				address?: string;
+				invoiceId?: string;
+				processor?: PaymentProcessor;
+				expiresAt?: Date;
+				checkoutId?: string;
+				meta?: unknown;
+				} | null>
+			>> = {
+				'Breez SDK': async () => {
+				if (!isBreezConfigured()) return null;
+				try {
+					const invoice = await createLightningInvoice(
+					satoshis,
+					label,
+					params.expiresAt ? differenceInSeconds(params.expiresAt, new Date()) : 3600
+					);
 					return {
-						address: invoice.payment_address,
-						invoiceId: invoice.invoiceId,
-						processor: 'swiss-bitcoin-pay'
+					address: invoice.paymentRequest,
+					invoiceId: invoice.id,
+					processor: 'Breez SDK',
+					expiresAt: invoice.expiresAt
 					};
+				} catch (e) {
+					console.error('[Breez] Invoice creation failed:', e);
+					return null;
+				}
+				},
+				// Ici, remets les vrais appels existants plutôt que des placeholders
+				'swiss-bitcoin-pay': async () => {
+				const invoice = await swissBitcoinPayCreateInvoice({
+					label,
+					orderId: params.orderId,
+					toPay: { amount: satoshis, currency: 'SAT' },
+					expiresAt: params.expiresAt
+				});
+				return {
+					address: invoice.paymentAddress,
+					invoiceId: invoice.invoiceId,
+					processor: 'swiss-bitcoin-pay'
+				};
 				},
 				'btcpay-server': async () => {
-					const invoice = await btcpayServerCreateInvoice({
-						label,
-						expiresAt: params.expiresAt,
-						amountInSats: satoshis
-					});
-					return {
-						address: invoice.payment_address,
-						invoiceId: invoice.invoiceId,
-						processor: 'btcpay-server'
-					};
+				const invoice = await btcpayServerCreateInvoice({
+					label,
+					amountSats: satoshis,
+					expiresAt: params.expiresAt
+				});
+				return {
+					address: invoice.paymentAddress,
+					invoiceId: invoice.invoiceId,
+					processor: 'btcpay-server'
+				};
 				},
-				phoenixd: async () => {
-					const invoice = await phoenixdCreateInvoice(satoshis, label, params.orderId);
-					return {
-						address: invoice.payment_address,
-						invoiceId: invoice.r_hash,
-						processor: 'phoenixd'
-					};
+				'phoenixd': async () => {
+				const invoice = await phoenixdCreateInvoice(satoshis, label, params.orderId);
+				return {
+					address: invoice.paymentaddress,
+					invoiceId: invoice.rhash,
+					processor: 'phoenixd'
+				};
 				},
-				lnd: async () => {
-					const invoice = await lndCreateInvoice(satoshis, {
-						...(params.expiresAt && {
-							expireAfterSeconds: differenceInSeconds(params.expiresAt, new Date())
-						}),
-						label
-					});
-					return {
-						address: invoice.payment_request,
-						invoiceId: invoice.r_hash,
-						processor: 'lnd'
-					};
+				'lnd': async () => {
+				const invoice = await lndCreateInvoice(
+					satoshis,
+					params.expiresAt ? differenceInSeconds(params.expiresAt, new Date()) : undefined,
+					label
+				);
+				return {
+					address: invoice.paymentrequest,
+					invoiceId: invoice.rhash,
+					processor: 'lnd'
+				};
 				}
 			};
 
-			const orderedProcessors =
-				preference && availability[preference]
-					? [preference, ...hardcodedPriority.filter((p) => p !== preference)]
-					: hardcodedPriority;
-
 			for (const processor of orderedProcessors) {
-				if (availability[processor]) {
-					const generator = generators[processor];
-					if (generator) {
-						return await generator();
-					}
+				const generator = generators[processor];
+				if (!generator) continue;
+				const res = await generator();
+				if (res) {
+				return res; // la fonction generatePaymentInfo renvoie déjà ce shape
 				}
 			}
 
-			throw new Error('No lightning payment processors available.');
+			throw new Error('No lightning payment processors available');
+			}
+
+
+		const satoshis = toSatoshis(params.toPay.amount, params.toPay.currency);
+		
+		// PRIORITÉ CONFIGURABLE + HARDCODÉE
+		const preference = runtimeConfig.paymentProcessorPreferences?.lightning;
+		const hardcodedPriority: PaymentProcessor[] = [
+			'Breez SDK',           // 🔥 PRIORITÉ #1
+			'swiss-bitcoin-pay',
+			'btcpay-server', 
+			'phoenixd',
+			'lnd'
+		];
+
+		const availability: Partial<Record<PaymentProcessor, boolean>> = {
+			'Breez SDK': isBreezConfigured(),
+			'swiss-bitcoin-pay': isSwissBitcoinPayConfigured(),
+			'btcpay-server': isBtcpayServerConfigured(),
+			'phoenixd': isPhoenixdConfigured(),
+			'lnd': isLndConfigured()
+		};
+
+		const orderedProcessors = preference 
+			? preference.filter((p): p is PaymentProcessor => availability[p])
+			: hardcodedPriority.filter(p => availability[p]);
+
+		// Générateurs Lightning (Breez en 1er !)
+		const generators: Partial<Record<
+			PaymentProcessor, 
+			() => Promise<
+			{ address?: string; invoiceId?: string; processor?: PaymentProcessor; expiresAt?: Date } | null
+			>
+		>> = {
+			// 🔥 BREEZ SDK - PRIORITÉ #1
+			'Breez SDK': async () => {
+			if (!isBreezConfigured()) return null;
+			try {
+				const invoice = await createLightningInvoice(
+				satoshis,
+				`${label} #${params.orderNumber}`,
+				params.expiresAt ? differenceInSeconds(params.expiresAt, new Date()) : 3600
+				);
+				return {
+				address: invoice.paymentRequest,
+				invoiceId: invoice.id,
+				processor: 'Breez SDK' as PaymentProcessor,
+				expiresAt: invoice.expiresAt
+				};
+			} catch (error: any) {
+				console.error('[Breez SDK] Invoice creation failed:', error.message);
+				return null; // Fallback vers autres processeurs
+			}
+			},
+
+			// ✅ EXISTANTS (inchangés)
+			'swiss-bitcoin-pay': async () => {
+			const invoice = await swissBitcoinPayCreateInvoice(
+				label, 
+				params.orderNumber, 
+				{ amount: satoshis, currency: 'SAT' },
+				params.expiresAt
+			);
+			return {
+				address: invoice.paymentaddress,
+				invoiceId: invoice.invoiceId,
+				processor: 'swiss-bitcoin-pay'
+			};
+			},
+
+			'btcpay-server': async () => {
+			const invoice = await btcpayServerCreateInvoice(
+				label, 
+				satoshis, 
+				params.expiresAt
+			);
+			return {
+				address: invoice.paymentaddress,
+				invoiceId: invoice.invoiceId,
+				processor: 'btcpay-server'
+			};
+			},
+
+			'phoenixd': async () => {
+			const invoice = await phoenixdCreateInvoice(
+				satoshis, 
+				label, 
+				params.orderId
+			);
+			return {
+				address: invoice.paymentaddress,
+				invoiceId: invoice.rhash,
+				processor: 'phoenixd'
+			};
+			},
+
+			'lnd': async () => {
+			const invoice = await lndCreateInvoice(
+				satoshis,
+				params.expiresAt ? differenceInSeconds(params.expiresAt, new Date()) : undefined,
+				label
+			);
+			return {
+				address: invoice.payment_request,
+				invoiceId: invoice.rhash,
+				processor: 'lnd'
+			};
+			}
+		};
+
+		// 🎯 ESSAI DANS L'ORDRE DE PRIORITÉ
+		for (const processor of orderedProcessors) {
+			const generator = generators[processor];
+			if (generator) {
+			const result = await generator();
+			if (result) {
+				console.info(`[Lightning] Invoice créée via ${processor} pour Order #${params.orderNumber}`);
+				return result;
+			}
+			}
 		}
+
+		throw new Error('No lightning payment processors available');
+
+
 		case 'point-of-sale': {
 		}
 		case 'free': {

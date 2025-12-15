@@ -1,4 +1,5 @@
-<script lang="ts">
+<!-- src/routes/%28app%29/checkout/%2Bpage.svelte-->
+ <script lang="ts">
 	import { applyAction, enhance } from '$app/forms';
 	import { goto } from '$app/navigation';
 	import CartQuantity from '$lib/components/CartQuantity.svelte';
